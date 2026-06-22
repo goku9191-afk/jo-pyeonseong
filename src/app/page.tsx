@@ -1,17 +1,16 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef } from "react";
 import * as XLSX from "xlsx";
 
 type Student = { id: string; name: string };
-type ClassRoster = { id: string; className: string; students: Student[] };
 type Group = { groupNum: number; students: Student[] };
 type ManualPin = { studentId: string; groupNum: number };
+type ClassGroup = { label: string; names: string[] };
 
 function uid() {
   return Math.random().toString(36).slice(2, 9);
 }
-
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -20,655 +19,376 @@ function shuffle<T>(arr: T[]): T[] {
   }
   return a;
 }
-
 function assignGroups(students: Student[], numGroups: number, pins: ManualPin[]): Group[] {
-  const groups: Group[] = Array.from({ length: numGroups }, (_, i) => ({
-    groupNum: i + 1,
-    students: [],
-  }));
-
+  const groups: Group[] = Array.from({ length: numGroups }, (_, i) => ({ groupNum: i + 1, students: [] }));
   const pinnedIds = new Set(pins.map((p) => p.studentId));
   for (const pin of pins) {
     const g = groups.find((g) => g.groupNum === pin.groupNum);
-    const student = students.find((s) => s.id === pin.studentId);
-    if (g && student) g.students.push(student);
+    const s = students.find((s) => s.id === pin.studentId);
+    if (g && s) g.students.push(s);
   }
-
-  const free = shuffle(students.filter((s) => !pinnedIds.has(s.id)));
-  for (const student of free) {
-    const smallest = groups.reduce((a, b) => (a.students.length <= b.students.length ? a : b));
-    smallest.students.push(student);
+  for (const s of shuffle(students.filter((s) => !pinnedIds.has(s.id)))) {
+    groups.reduce((a, b) => (a.students.length <= b.students.length ? a : b)).students.push(s);
   }
-
   return groups;
 }
 
-const TAB_LABELS = ["📋 명렬 관리", "🎲 조편성 설정", "✨ 결과 보기"];
-type Tab = 0 | 1 | 2;
+const NOT_NAMES = new Set(["성명", "이름", "학생명", "교사명", "담임명", "비고", "합계", "총점", "평균", "학과", "학년", "학급", "번호", "합격", "성별"]);
+const isKoreanName = (v: unknown): boolean =>
+  typeof v === "string" && /^[가-힣]{2,4}$/.test((v as string).trim()) && !NOT_NAMES.has((v as string).trim());
+
+function parseSheet(rows: unknown[][]): ClassGroup[] {
+  if (!rows.length) return [];
+
+  // 1. 이름 열 찾기: 한글 이름이 가장 많은 열
+  const maxCols = Math.max(...rows.map((r) => (r as unknown[]).length), 0);
+  const colCounts = new Array(maxCols).fill(0);
+  for (const row of rows)
+    for (let j = 0; j < (row as unknown[]).length; j++)
+      if (isKoreanName((row as unknown[])[j])) colCounts[j]++;
+
+  const bestCount = Math.max(...colCounts);
+  if (bestCount < 2) return [];
+  const nameCol = colCounts.indexOf(bestCount);
+
+  // 2. 반 열 찾기: 이름 열 왼쪽에서 작은 정수가 반복되는 열
+  let classCol = -1;
+  for (let j = nameCol - 1; j >= 0; j--) {
+    const vals = rows.map((r) => (r as unknown[])[j]).filter((v) => v !== null && v !== undefined && v !== "");
+    const nums = vals.filter((v) => typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= 30);
+    if (nums.length < 2) continue;
+    const uniqueNums = new Set(nums).size;
+    const avgPerClass = nums.length / uniqueNums;
+    // 반 컬럼: 고유값 2~20개이고 학생이 클래스당 평균 3명 이상
+    if (uniqueNums >= 2 && uniqueNums <= 20 && avgPerClass >= 3) {
+      classCol = j;
+      break;
+    }
+  }
+
+  // 3. 반 컬럼이 있으면 반별로 분리
+  if (classCol >= 0) {
+    const classMap = new Map<number, string[]>();
+    for (const row of rows) {
+      const r = row as unknown[];
+      const classVal = r[classCol];
+      const name = String(r[nameCol] ?? "").trim();
+      if (typeof classVal === "number" && isKoreanName(name)) {
+        if (!classMap.has(classVal)) classMap.set(classVal, []);
+        classMap.get(classVal)!.push(name);
+      }
+    }
+    const sorted = [...classMap.entries()].sort((a, b) => a[0] - b[0]);
+    return sorted.map(([num, names]) => ({ label: `${num}반`, names }));
+  }
+
+  // 4. 반 컬럼 없으면 시트 전체를 하나로
+  const names = rows.map((r) => String((r as unknown[])[nameCol] ?? "").trim()).filter(isKoreanName);
+  return [{ label: "전체", names }];
+}
 
 export default function Page() {
-  const [tab, setTab] = useState<Tab>(0);
-  const [rosters, setRosters] = useState<ClassRoster[]>([]);
-  const [selectedRosterId, setSelectedRosterId] = useState<string | null>(null);
-  const [newClassName, setNewClassName] = useState("");
-  const [directInput, setDirectInput] = useState("");
+  const [students, setStudents] = useState<Student[]>([]);
+  const [textInput, setTextInput] = useState("");
+  const [classGroups, setClassGroups] = useState<{ sheetName: string; classes: ClassGroup[] }[]>([]);
+  const [activeSheet, setActiveSheet] = useState<string | null>(null);
+  const [activeClass, setActiveClass] = useState<string | null>(null);
   const [numGroups, setNumGroups] = useState(4);
   const [pins, setPins] = useState<ManualPin[]>([]);
-  const [result, setResult] = useState<Group[] | null>(null);
   const [pinStudentId, setPinStudentId] = useState("");
   const [pinGroupNum, setPinGroupNum] = useState(1);
+  const [showPins, setShowPins] = useState(false);
+  const [result, setResult] = useState<Group[] | null>(null);
   const [copyDone, setCopyDone] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const selectedRoster = rosters.find((r) => r.id === selectedRosterId) ?? null;
-
-  /* ─── 명렬 관리 ─── */
-  const addRoster = () => {
-    const name = newClassName.trim();
-    if (!name) return;
-    const id = uid();
-    setRosters((prev) => [...prev, { id, className: name, students: [] }]);
-    setSelectedRosterId(id);
-    setNewClassName("");
+  const addNames = (text: string) => {
+    const names = text.split(/[\n,，、\t]+/).map((s) => s.trim()).filter(Boolean);
+    if (!names.length) return;
+    setStudents((prev) => {
+      const existing = new Set(prev.map((s) => s.name));
+      return [...prev, ...names.filter((n) => !existing.has(n)).map((n) => ({ id: uid(), name: n }))];
+    });
+    setTextInput("");
+    setResult(null);
   };
 
-  const deleteRoster = (id: string) => {
-    setRosters((prev) => prev.filter((r) => r.id !== id));
-    if (selectedRosterId === id) {
-      setSelectedRosterId(rosters.find((r) => r.id !== id)?.id ?? null);
-    }
+  const loadClass = (names: string[]) => {
+    setStudents(names.map((n) => ({ id: uid(), name: n })));
+    setPins([]);
+    setResult(null);
   };
 
-  const addStudentsFromText = useCallback(
-    (text: string, rosterId: string) => {
-      const names = text
-        .split(/[\n,，、\t]+/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (!names.length) return;
-      setRosters((prev) =>
-        prev.map((r) =>
-          r.id === rosterId
-            ? {
-                ...r,
-                students: [
-                  ...r.students,
-                  ...names
-                    .filter((n) => !r.students.some((s) => s.name === n))
-                    .map((n) => ({ id: uid(), name: n })),
-                ],
-              }
-            : r
-        )
-      );
-      setDirectInput("");
-    },
-    []
-  );
+  const handleExcel = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const data = new Uint8Array(e.target?.result as ArrayBuffer);
+      const wb = XLSX.read(data, { type: "array" });
+      const parsed = wb.SheetNames.map((sheetName) => {
+        const ws = wb.Sheets[sheetName];
+        const rows: unknown[][] = XLSX.utils.sheet_to_json(ws, { header: 1 });
+        return { sheetName, classes: parseSheet(rows) };
+      }).filter((s) => s.classes.length > 0 && s.classes.some((c) => c.names.length > 0));
 
-  const removeStudent = (rosterId: string, studentId: string) => {
-    setRosters((prev) =>
-      prev.map((r) =>
-        r.id === rosterId ? { ...r, students: r.students.filter((s) => s.id !== studentId) } : r
-      )
-    );
-    setPins((prev) => prev.filter((p) => p.studentId !== studentId));
+      setClassGroups(parsed);
+      if (parsed.length > 0) {
+        setActiveSheet(parsed[0].sheetName);
+        const firstClass = parsed[0].classes[0];
+        setActiveClass(firstClass.label);
+        loadClass(firstClass.names);
+      }
+    };
+    reader.readAsArrayBuffer(file);
   };
 
-  const handleExcel = useCallback(
-    (file: File, rosterId: string) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const data = new Uint8Array(e.target?.result as ArrayBuffer);
-        const wb = XLSX.read(data, { type: "array" });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows: string[][] = XLSX.utils.sheet_to_json(ws, { header: 1 });
+  const removeStudent = (id: string) => {
+    setStudents((prev) => prev.filter((s) => s.id !== id));
+    setPins((prev) => prev.filter((p) => p.studentId !== id));
+    setResult(null);
+  };
 
-        const header = rows[0]?.map((c) => String(c ?? "").trim()) ?? [];
-        const nameColIdx = (() => {
-          const idx = header.findIndex((h) => ["이름", "성명", "학생명"].includes(h));
-          return idx >= 0 ? idx : 1;
-        })();
-
-        const names = rows
-          .slice(1)
-          .map((r) => String(r[nameColIdx] ?? "").trim())
-          .filter(Boolean);
-
-        addStudentsFromText(names.join("\n"), rosterId);
-      };
-      reader.readAsArrayBuffer(file);
-    },
-    [addStudentsFromText]
-  );
-
-  /* ─── 조편성 ─── */
   const addPin = () => {
     if (!pinStudentId) return;
-    setPins((prev) => {
-      const next = prev.filter((p) => p.studentId !== pinStudentId);
-      return [...next, { studentId: pinStudentId, groupNum: pinGroupNum }];
-    });
+    setPins((prev) => [...prev.filter((p) => p.studentId !== pinStudentId), { studentId: pinStudentId, groupNum: pinGroupNum }]);
     setPinStudentId("");
   };
 
-  const removePin = (studentId: string) => {
-    setPins((prev) => prev.filter((p) => p.studentId !== studentId));
-  };
-
   const doAssign = () => {
-    if (!selectedRoster || selectedRoster.students.length === 0) return;
-    const validPins = pins.filter(
-      (p) => p.groupNum <= numGroups && selectedRoster.students.some((s) => s.id === p.studentId)
-    );
-    setResult(assignGroups(selectedRoster.students, numGroups, validPins));
-    setTab(2);
+    if (students.length < 2) return;
+    const validPins = pins.filter((p) => p.groupNum <= numGroups && students.some((s) => s.id === p.studentId));
+    setResult(assignGroups(students, numGroups, validPins));
   };
 
-  /* ─── 결과 복사 ─── */
   const copyResult = async () => {
     if (!result) return;
-    const text = result
-      .map((g) => `[${g.groupNum}조]\n${g.students.map((s) => s.name).join(", ")}`)
-      .join("\n\n");
-    await navigator.clipboard.writeText(text);
+    await navigator.clipboard.writeText(
+      result.map((g) => `[${g.groupNum}조]\n${g.students.map((s) => s.name).join(", ")}`).join("\n\n")
+    );
     setCopyDone(true);
     setTimeout(() => setCopyDone(false), 2000);
   };
 
-  /* ─── UI ─── */
+  const currentSheet = classGroups.find((s) => s.sheetName === activeSheet);
+
+  // ── 스타일 상수
+  const S = {
+    card: { background: "rgba(255,255,255,0.75)", border: "1px solid rgba(196,181,253,0.4)", borderRadius: 16, padding: 20, boxShadow: "0 2px 12px rgba(124,58,237,.06)", backdropFilter: "blur(12px)" } as React.CSSProperties,
+    primary: "#7c3aed",
+    primaryBg: "#ede9fe",
+    muted: "#6d6a8a",
+    label: { fontSize: 11, fontWeight: 700, letterSpacing: ".06em", color: "#a89fc0", textTransform: "uppercase" } as React.CSSProperties,
+  };
+
   return (
-    <div
-      className="min-h-screen"
-      style={{ background: "linear-gradient(135deg, #fdf4ff 0%, #ffe8f0 50%, #e8f4ff 100%)" }}
-    >
+    <div style={{ minHeight: "100vh", background: "linear-gradient(145deg, #ede9fe 0%, #dbeafe 50%, #bae6fd 100%)", color: "#1e1b4b", fontFamily: "'Pretendard','Apple SD Gothic Neo','Noto Sans KR',sans-serif" }}>
       {/* Header */}
-      <header className="text-center pt-8 pb-2">
-        <h1 className="text-3xl font-bold" style={{ color: "#c084fc" }}>
-          🌸 조편성 프로그램
-        </h1>
-        <p className="text-sm mt-1" style={{ color: "#a78bca" }}>
-          쉽고 빠른 학급 조편성
-        </p>
+      <header style={{ borderBottom: "1px solid rgba(196,181,253,0.35)", background: "rgba(255,255,255,0.55)", backdropFilter: "blur(16px)", padding: "0 24px" }}>
+        <div style={{ maxWidth: 600, margin: "0 auto", height: 56, display: "flex", alignItems: "center" }}>
+          <span style={{ fontWeight: 700, fontSize: 17, color: "#3b0764" }}>조편성 프로그램</span>
+        </div>
       </header>
 
-      {/* Tabs */}
-      <div className="flex justify-center gap-2 mt-6 px-4">
-        {TAB_LABELS.map((label, i) => (
-          <button
-            key={i}
-            onClick={() => setTab(i as Tab)}
-            className="px-4 py-2 rounded-full text-sm font-semibold transition-all"
-            style={
-              tab === i
-                ? { background: "#c084fc", color: "white", boxShadow: "0 4px 12px #c084fc66" }
-                : { background: "white", color: "#a78bca", border: "2px solid #e9d5ff" }
-            }
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <main style={{ maxWidth: 600, margin: "0 auto", padding: "24px 16px 80px" }}>
 
-      <main className="max-w-2xl mx-auto px-4 py-6">
-        {/* ═══ TAB 0: 명렬 관리 ═══ */}
-        {tab === 0 && (
-          <div className="space-y-4">
-            {/* 반 추가 */}
-            <div
-              className="bg-white rounded-2xl p-5 shadow-sm"
-              style={{ border: "2px solid #e9d5ff" }}
-            >
-              <h2 className="font-bold mb-3" style={{ color: "#9333ea" }}>
-                반 추가
-              </h2>
-              <div className="flex gap-2">
-                <input
-                  value={newClassName}
-                  onChange={(e) => setNewClassName(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && addRoster()}
-                  placeholder="예: 2-6반, 1반, 과학탐구부..."
-                  className="flex-1 rounded-xl px-4 py-2 text-sm outline-none"
-                  style={{ border: "2px solid #e9d5ff", color: "#4a3f5c" }}
-                />
-                <button
-                  onClick={addRoster}
-                  className="px-4 py-2 rounded-xl text-sm font-bold text-white"
-                  style={{ background: "#c084fc" }}
-                >
-                  추가
-                </button>
-              </div>
-            </div>
-
-            {/* 반 목록 */}
-            {rosters.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {rosters.map((r) => (
-                  <button
-                    key={r.id}
-                    onClick={() => setSelectedRosterId(r.id)}
-                    className="flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-semibold transition-all"
-                    style={
-                      selectedRosterId === r.id
-                        ? { background: "#f0abfc", color: "white" }
-                        : { background: "white", color: "#9333ea", border: "2px solid #f0abfc" }
-                    }
-                  >
-                    {r.className}
-                    <span className="text-xs opacity-70">({r.students.length}명)</span>
-                    <span
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteRoster(r.id);
-                      }}
-                      className="ml-1 opacity-60 hover:opacity-100 cursor-pointer"
-                    >
-                      ✕
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {/* 학생 입력 */}
-            {selectedRoster && (
-              <div
-                className="bg-white rounded-2xl p-5 shadow-sm"
-                style={{ border: "2px solid #e9d5ff" }}
-              >
-                <h2 className="font-bold mb-1" style={{ color: "#9333ea" }}>
-                  {selectedRoster.className} 학생 추가
-                </h2>
-                <p className="text-xs mb-3" style={{ color: "#a78bca" }}>
-                  이름을 줄바꿈·쉼표로 구분해 입력하거나, 엑셀 파일을 업로드하세요.
-                </p>
-
-                <textarea
-                  value={directInput}
-                  onChange={(e) => setDirectInput(e.target.value)}
-                  placeholder={"김민지\n박서연\n이지우\n..."}
-                  rows={5}
-                  className="w-full rounded-xl px-4 py-3 text-sm outline-none resize-none"
-                  style={{ border: "2px solid #e9d5ff", color: "#4a3f5c" }}
-                />
-                <div className="flex gap-2 mt-2">
-                  <button
-                    onClick={() => addStudentsFromText(directInput, selectedRoster.id)}
-                    className="flex-1 py-2 rounded-xl text-sm font-bold text-white"
-                    style={{ background: "#c084fc" }}
-                  >
-                    입력 추가
-                  </button>
-                  <button
-                    onClick={() => fileRef.current?.click()}
-                    className="flex-1 py-2 rounded-xl text-sm font-bold"
-                    style={{
-                      background: "white",
-                      color: "#9333ea",
-                      border: "2px solid #e9d5ff",
-                    }}
-                  >
-                    엑셀 업로드 📂
-                  </button>
-                  <input
-                    ref={fileRef}
-                    type="file"
-                    accept=".xlsx,.xls"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f && selectedRoster) handleExcel(f, selectedRoster.id);
-                      e.target.value = "";
-                    }}
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* 학생 목록 */}
-            {selectedRoster && selectedRoster.students.length > 0 && (
-              <div
-                className="bg-white rounded-2xl p-5 shadow-sm"
-                style={{ border: "2px solid #e9d5ff" }}
-              >
-                <div className="flex justify-between items-center mb-3">
-                  <h2 className="font-bold" style={{ color: "#9333ea" }}>
-                    학생 목록 ({selectedRoster.students.length}명)
-                  </h2>
-                  <button
-                    onClick={() =>
-                      setRosters((prev) =>
-                        prev.map((r) =>
-                          r.id === selectedRoster.id ? { ...r, students: [] } : r
-                        )
-                      )
-                    }
-                    className="text-xs px-3 py-1 rounded-full"
-                    style={{
-                      color: "#f87171",
-                      border: "1.5px solid #fecaca",
-                      background: "white",
-                    }}
-                  >
-                    전체 삭제
-                  </button>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {selectedRoster.students.map((s) => (
-                    <span
-                      key={s.id}
-                      className="flex items-center gap-1 px-3 py-1 rounded-full text-sm pop-in"
-                      style={{
-                        background: "#fdf4ff",
-                        color: "#7e22ce",
-                        border: "1.5px solid #e9d5ff",
-                      }}
-                    >
-                      {s.name}
-                      <button
-                        onClick={() => removeStudent(selectedRoster.id, s.id)}
-                        className="opacity-40 hover:opacity-100 text-xs"
-                      >
-                        ✕
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {rosters.length === 0 && (
-              <div className="text-center py-12 opacity-60" style={{ color: "#a78bca" }}>
-                <p className="text-4xl mb-2">📚</p>
-                <p className="text-sm">반을 먼저 추가해 주세요!</p>
-              </div>
+        {/* ── 학생 명단 ── */}
+        <section style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <span style={S.label}>학생 명단</span>
+            {students.length > 0 && (
+              <button onClick={() => { setStudents([]); setPins([]); setResult(null); }} style={{ fontSize: 12, color: "#ef4444", background: "none", border: "none", cursor: "pointer" }}>
+                전체 삭제
+              </button>
             )}
           </div>
-        )}
 
-        {/* ═══ TAB 1: 조편성 설정 ═══ */}
-        {tab === 1 && (
-          <div className="space-y-4">
-            {/* 반 선택 */}
-            <div
-              className="bg-white rounded-2xl p-5 shadow-sm"
-              style={{ border: "2px solid #fce7f3" }}
+          {/* 직접 입력 */}
+          <textarea
+            value={textInput}
+            onChange={(e) => setTextInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && textInput.trim()) { e.preventDefault(); addNames(textInput); } }}
+            placeholder={"이름 입력 (Enter 또는 쉼표·줄바꿈으로 구분)\n예) 김민지, 박서연, 이지우"}
+            rows={4}
+            style={{ width: "100%", boxSizing: "border-box", border: "1px solid rgba(196,181,253,0.5)", borderRadius: 10, padding: "12px 14px", fontSize: 14, outline: "none", resize: "none", color: "#1e1b4b", background: "rgba(255,255,255,0.5)", fontFamily: "inherit" }}
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button
+              onClick={() => addNames(textInput)}
+              disabled={!textInput.trim()}
+              style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "none", background: S.primary, color: "white", fontWeight: 600, fontSize: 14, cursor: "pointer", opacity: textInput.trim() ? 1 : 0.4 }}
             >
-              <h2 className="font-bold mb-3" style={{ color: "#db2777" }}>
-                반 선택
-              </h2>
-              {rosters.length === 0 ? (
-                <p className="text-sm" style={{ color: "#f9a8d4" }}>
-                  먼저 명렬 관리에서 반을 추가해 주세요.
-                </p>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {rosters.map((r) => (
-                    <button
-                      key={r.id}
-                      onClick={() => {
-                        setSelectedRosterId(r.id);
-                        setPins([]);
-                      }}
-                      className="px-4 py-2 rounded-full text-sm font-semibold"
-                      style={
-                        selectedRosterId === r.id
-                          ? { background: "#fb7185", color: "white" }
-                          : {
-                              background: "white",
-                              color: "#db2777",
-                              border: "2px solid #fce7f3",
-                            }
-                      }
-                    >
-                      {r.className} ({r.students.length}명)
-                    </button>
-                  ))}
+              추가
+            </button>
+            <button
+              onClick={() => fileRef.current?.click()}
+              style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "1px solid rgba(196,181,253,0.5)", background: "rgba(255,255,255,0.6)", color: S.muted, fontWeight: 600, fontSize: 14, cursor: "pointer" }}
+            >
+              엑셀 업로드
+            </button>
+            <input ref={fileRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={(e) => { const f = e.target.files?.[0]; if (f) handleExcel(f); e.target.value = ""; }} />
+          </div>
+
+          {/* 시트 & 반 선택 */}
+          {classGroups.length > 0 && (
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid rgba(196,181,253,0.3)" }}>
+              {/* 시트 탭 */}
+              {classGroups.length > 1 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={S.label}>학년 선택</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                    {classGroups.map((sg) => (
+                      <button key={sg.sheetName} onClick={() => setActiveSheet(sg.sheetName)} style={{ padding: "5px 14px", borderRadius: 20, border: "1px solid", fontSize: 13, fontWeight: 600, cursor: "pointer", borderColor: activeSheet === sg.sheetName ? S.primary : "#e2e8f0", background: activeSheet === sg.sheetName ? S.primaryBg : "white", color: activeSheet === sg.sheetName ? S.primary : S.muted }}>
+                        {sg.sheetName}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* 반 탭 */}
+              {currentSheet && currentSheet.classes.length > 1 && (
+                <div>
+                  <div style={S.label}>반 선택</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+                    {currentSheet.classes.map((cls) => (
+                      <button
+                        key={cls.label}
+                        onClick={() => { setActiveClass(cls.label); loadClass(cls.names); }}
+                        style={{ padding: "5px 14px", borderRadius: 20, border: "1px solid", fontSize: 13, fontWeight: 600, cursor: "pointer", borderColor: activeClass === cls.label ? S.primary : "#e2e8f0", background: activeClass === cls.label ? S.primaryBg : "white", color: activeClass === cls.label ? S.primary : S.muted }}
+                      >
+                        {cls.label} <span style={{ fontWeight: 400, opacity: 0.7 }}>({cls.names.length}명)</span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
+          )}
 
-            {selectedRoster && selectedRoster.students.length > 0 && (
-              <>
-                {/* 조 수 설정 */}
-                <div
-                  className="bg-white rounded-2xl p-5 shadow-sm"
-                  style={{ border: "2px solid #fce7f3" }}
-                >
-                  <h2 className="font-bold mb-4" style={{ color: "#db2777" }}>
-                    조 수 설정
-                  </h2>
-                  <div className="flex items-center gap-4">
-                    <button
-                      onClick={() => setNumGroups((n) => Math.max(2, n - 1))}
-                      className="w-10 h-10 rounded-full text-xl font-bold flex items-center justify-center"
-                      style={{ background: "#fce7f3", color: "#db2777" }}
-                    >
-                      −
-                    </button>
-                    <span
-                      className="text-3xl font-bold"
-                      style={{ color: "#db2777", minWidth: 70, textAlign: "center" }}
-                    >
-                      {numGroups}조
-                    </span>
-                    <button
-                      onClick={() =>
-                        setNumGroups((n) => Math.min(selectedRoster.students.length, n + 1))
-                      }
-                      className="w-10 h-10 rounded-full text-xl font-bold flex items-center justify-center"
-                      style={{ background: "#fce7f3", color: "#db2777" }}
-                    >
-                      +
-                    </button>
-                  </div>
-                  <p className="text-xs mt-3" style={{ color: "#f9a8d4" }}>
-                    {selectedRoster.students.length}명 → 조당 약{" "}
-                    {Math.ceil(selectedRoster.students.length / numGroups)}명
-                  </p>
-                </div>
+          {/* 학생 태그 */}
+          {students.length > 0 && (
+            <div style={{ marginTop: 14 }}>
+              <span style={{ ...S.label, marginBottom: 8, display: "block" }}>현재 {students.length}명</span>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {students.map((s) => (
+                  <span key={s.id} style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 10px", borderRadius: 20, fontSize: 13, background: "rgba(237,233,254,0.6)", color: "#3b0764" }}>
+                    {s.name}
+                    <button onClick={() => removeStudent(s.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#94a3b8", fontSize: 11, padding: 0, lineHeight: 1 }}>✕</button>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
 
-                {/* 수동 배정 */}
-                <div
-                  className="bg-white rounded-2xl p-5 shadow-sm"
-                  style={{ border: "2px solid #fce7f3" }}
-                >
-                  <h2 className="font-bold mb-1" style={{ color: "#db2777" }}>
-                    수동 배정 <span className="font-normal text-sm opacity-70">(선택)</span>
-                  </h2>
-                  <p className="text-xs mb-3" style={{ color: "#f9a8d4" }}>
-                    특정 학생을 고정 배치하고 나머지는 자동 배정됩니다.
-                  </p>
-                  <div className="flex gap-2 mb-3">
-                    <select
-                      value={pinStudentId}
-                      onChange={(e) => setPinStudentId(e.target.value)}
-                      className="flex-1 rounded-xl px-3 py-2 text-sm outline-none"
-                      style={{ border: "2px solid #fce7f3", color: "#4a3f5c" }}
-                    >
+        {/* ── 조편성 설정 ── */}
+        <section style={{ ...S.card, marginTop: 12 }}>
+          <div style={{ ...S.label, marginBottom: 16 }}>조편성 설정</div>
+
+          {/* 조 수 */}
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4 }}>
+            <button onClick={() => setNumGroups((n) => Math.max(2, n - 1))} style={{ width: 36, height: 36, borderRadius: "50%", border: "1px solid rgba(196,181,253,0.5)", background: "rgba(255,255,255,0.6)", fontSize: 20, cursor: "pointer", color: S.muted, display: "flex", alignItems: "center", justifyContent: "center" }}>−</button>
+            <span style={{ fontSize: 28, fontWeight: 700, minWidth: 80, textAlign: "center", color: "#1e1b4b" }}>{numGroups}조</span>
+            <button onClick={() => setNumGroups((n) => (students.length ? Math.min(students.length, n + 1) : n + 1))} style={{ width: 36, height: 36, borderRadius: "50%", border: "1px solid rgba(196,181,253,0.5)", background: "rgba(255,255,255,0.6)", fontSize: 20, cursor: "pointer", color: S.muted, display: "flex", alignItems: "center", justifyContent: "center" }}>+</button>
+            {students.length > 0 && (
+              <span style={{ fontSize: 13, color: S.muted }}>→ 조당 약 {Math.ceil(students.length / numGroups)}명</span>
+            )}
+          </div>
+
+          {/* 수동 배정 토글 */}
+          <button onClick={() => setShowPins((v) => !v)} style={{ marginTop: 14, fontSize: 13, color: S.muted, background: "none", border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, padding: 0 }}>
+            <span style={{ fontSize: 10 }}>{showPins ? "▲" : "▼"}</span> 수동 배정 (특정 학생 고정)
+          </button>
+
+          {showPins && (
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid rgba(196,181,253,0.3)" }}>
+              {students.length === 0 ? (
+                <span style={{ fontSize: 13, color: "#94a3b8" }}>학생을 먼저 추가해 주세요.</span>
+              ) : (
+                <>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <select value={pinStudentId} onChange={(e) => setPinStudentId(e.target.value)} style={{ flex: 1, padding: "9px 12px", borderRadius: 10, border: "1px solid rgba(196,181,253,0.5)", fontSize: 13, color: "#1e1b4b", outline: "none", background: "rgba(255,255,255,0.6)" }}>
                       <option value="">학생 선택</option>
-                      {selectedRoster.students.map((s) => {
+                      {students.map((s) => {
                         const pin = pins.find((p) => p.studentId === s.id);
-                        return (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                            {pin ? ` → ${pin.groupNum}조 고정` : ""}
-                          </option>
-                        );
+                        return <option key={s.id} value={s.id}>{s.name}{pin ? ` (${pin.groupNum}조 고정)` : ""}</option>;
                       })}
                     </select>
-                    <select
-                      value={pinGroupNum}
-                      onChange={(e) => setPinGroupNum(Number(e.target.value))}
-                      className="w-24 rounded-xl px-3 py-2 text-sm outline-none"
-                      style={{ border: "2px solid #fce7f3", color: "#4a3f5c" }}
-                    >
-                      {Array.from({ length: numGroups }, (_, i) => (
-                        <option key={i + 1} value={i + 1}>
-                          {i + 1}조
-                        </option>
-                      ))}
+                    <select value={pinGroupNum} onChange={(e) => setPinGroupNum(Number(e.target.value))} style={{ width: 80, padding: "9px 12px", borderRadius: 10, border: "1px solid rgba(196,181,253,0.5)", fontSize: 13, color: "#1e1b4b", outline: "none", background: "rgba(255,255,255,0.6)" }}>
+                      {Array.from({ length: numGroups }, (_, i) => <option key={i + 1} value={i + 1}>{i + 1}조</option>)}
                     </select>
-                    <button
-                      onClick={addPin}
-                      className="px-4 py-2 rounded-xl text-sm font-bold text-white"
-                      style={{ background: "#fb7185" }}
-                    >
-                      고정
-                    </button>
+                    <button onClick={addPin} style={{ padding: "9px 16px", borderRadius: 10, border: "none", background: S.primary, color: "white", fontWeight: 600, fontSize: 13, cursor: "pointer" }}>고정</button>
                   </div>
-
                   {pins.length > 0 && (
-                    <div className="flex flex-wrap gap-2">
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
                       {pins.map((p) => {
-                        const student = selectedRoster.students.find((s) => s.id === p.studentId);
-                        if (!student) return null;
+                        const s = students.find((s) => s.id === p.studentId);
+                        if (!s) return null;
                         return (
-                          <span
-                            key={p.studentId}
-                            className="flex items-center gap-1 px-3 py-1 rounded-full text-sm"
-                            style={{
-                              background: "#fff1f2",
-                              color: "#be123c",
-                              border: "1.5px solid #fecdd3",
-                            }}
-                          >
-                            📌 {student.name} → {p.groupNum}조
-                            <button
-                              onClick={() => removePin(p.studentId)}
-                              className="opacity-40 hover:opacity-100 text-xs ml-1"
-                            >
-                              ✕
-                            </button>
+                          <span key={p.studentId} style={{ display: "flex", alignItems: "center", gap: 4, padding: "4px 10px", borderRadius: 20, fontSize: 12, background: "#eef2ff", color: S.primary, border: "1px solid #c7d2fe" }}>
+                            📌 {s.name} → {p.groupNum}조
+                            <button onClick={() => setPins((prev) => prev.filter((x) => x.studentId !== p.studentId))} style={{ background: "none", border: "none", cursor: "pointer", color: S.primary, fontSize: 11, padding: 0, opacity: 0.6 }}>✕</button>
                           </span>
                         );
                       })}
                     </div>
                   )}
-                </div>
-
-                {/* 배정 버튼 */}
-                <button
-                  onClick={doAssign}
-                  className="w-full py-4 rounded-2xl text-lg font-bold text-white transition-transform active:scale-95"
-                  style={{
-                    background: "linear-gradient(135deg, #f472b6, #c084fc)",
-                    boxShadow: "0 4px 20px #c084fc55",
-                  }}
-                >
-                  🎲 랜덤 조편성 시작!
-                </button>
-              </>
-            )}
-
-            {(!selectedRoster || selectedRoster.students.length === 0) &&
-              rosters.length > 0 && (
-                <div className="text-center py-8 opacity-60" style={{ color: "#f9a8d4" }}>
-                  <p className="text-4xl mb-2">👆</p>
-                  <p className="text-sm">반을 선택하고 학생을 추가해 주세요.</p>
-                </div>
+                </>
               )}
-          </div>
-        )}
+            </div>
+          )}
 
-        {/* ═══ TAB 2: 결과 ═══ */}
-        {tab === 2 && (
-          <div className="space-y-4">
-            {result ? (
-              <>
-                <div className="flex justify-between items-center">
-                  <h2 className="font-bold text-lg" style={{ color: "#0369a1" }}>
-                    {selectedRoster?.className} 결과
-                  </h2>
-                  <div className="flex gap-2">
-                    <button
-                      onClick={copyResult}
-                      className="px-4 py-2 rounded-full text-sm font-bold transition-all"
-                      style={
-                        copyDone
-                          ? { background: "#bbf7d0", color: "#15803d" }
-                          : {
-                              background: "white",
-                              color: "#0369a1",
-                              border: "2px solid #bae6fd",
-                            }
-                      }
-                    >
-                      {copyDone ? "복사됨 ✓" : "복사 📋"}
-                    </button>
-                    <button
-                      onClick={() => window.print()}
-                      className="px-4 py-2 rounded-full text-sm font-bold"
-                      style={{
-                        background: "white",
-                        color: "#0369a1",
-                        border: "2px solid #bae6fd",
-                      }}
-                    >
-                      인쇄 🖨️
-                    </button>
-                  </div>
-                </div>
+          {/* 배정 버튼 */}
+          <button
+            onClick={doAssign}
+            disabled={students.length < 2}
+            style={{ marginTop: 20, width: "100%", padding: "14px 0", borderRadius: 12, border: "none", background: students.length >= 2 ? S.primary : "#e2e8f0", color: students.length >= 2 ? "white" : "#94a3b8", fontWeight: 700, fontSize: 15, cursor: students.length >= 2 ? "pointer" : "default", letterSpacing: ".02em" }}
+          >
+            조편성 시작
+          </button>
+        </section>
 
-                <div className="grid grid-cols-2 gap-3">
-                  {result.map((g) => (
-                    <div
-                      key={g.groupNum}
-                      className="bg-white rounded-2xl p-4 shadow-sm pop-in"
-                      style={{ border: "2px solid #bae6fd" }}
-                    >
-                      <div
-                        className="text-sm font-bold mb-2 px-3 py-1 rounded-full inline-block"
-                        style={{ background: "#e0f2fe", color: "#0369a1" }}
-                      >
-                        {g.groupNum}조
-                      </div>
-                      <ul className="space-y-1 mt-1">
-                        {g.students.map((s) => {
-                          const isPinned = pins.some((p) => p.studentId === s.id);
-                          return (
-                            <li
-                              key={s.id}
-                              className="text-sm flex items-center gap-1"
-                              style={{ color: "#334155" }}
-                            >
-                              {isPinned && <span className="text-xs">📌</span>}
-                              {s.name}
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    </div>
-                  ))}
-                </div>
-
-                <button
-                  onClick={doAssign}
-                  className="w-full py-3 rounded-2xl text-sm font-bold text-white"
-                  style={{ background: "linear-gradient(135deg, #60a5fa, #a78bfa)" }}
-                >
-                  🔄 다시 뽑기
+        {/* ── 결과 ── */}
+        {result && (
+          <section style={{ ...S.card, marginTop: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <span style={S.label}>결과</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={copyResult} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid #e2e8f0", background: copyDone ? "#dcfce7" : "white", color: copyDone ? "#16a34a" : S.muted, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
+                  {copyDone ? "복사됨 ✓" : "복사"}
                 </button>
-                <button
-                  onClick={() => setTab(1)}
-                  className="w-full py-3 rounded-2xl text-sm font-bold"
-                  style={{
-                    background: "white",
-                    color: "#0369a1",
-                    border: "2px solid #bae6fd",
-                  }}
-                >
-                  설정 변경하기
+                <button onClick={() => window.print()} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(196,181,253,0.5)", background: "rgba(255,255,255,0.6)", color: S.muted, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>
+                  인쇄
                 </button>
-              </>
-            ) : (
-              <div className="text-center py-12 opacity-60" style={{ color: "#7dd3fc" }}>
-                <p className="text-4xl mb-2">🎲</p>
-                <p className="text-sm">조편성 설정에서 배정을 먼저 실행해 주세요!</p>
               </div>
-            )}
-          </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {result.map((g) => (
+                <div key={g.groupNum} style={{ background: "rgba(255,255,255,0.45)", border: "1px solid rgba(196,181,253,0.4)", borderRadius: 12, padding: 14 }}>
+                  <div style={{ display: "inline-block", padding: "2px 12px", borderRadius: 20, background: S.primary, color: "white", fontSize: 12, fontWeight: 700, marginBottom: 10 }}>
+                    {g.groupNum}조
+                  </div>
+                  <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+                    {g.students.map((s) => (
+                      <li key={s.id} style={{ fontSize: 14, color: "#2e1065", display: "flex", alignItems: "center", gap: 4 }}>
+                        {pins.some((p) => p.studentId === s.id) && <span style={{ fontSize: 11 }}>📌</span>}
+                        {s.name}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button onClick={doAssign} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "none", background: "#0f172a", color: "white", fontWeight: 600, fontSize: 14, cursor: "pointer" }}>
+                다시 뽑기
+              </button>
+              <button onClick={() => setResult(null)} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "1px solid rgba(196,181,253,0.5)", background: "rgba(255,255,255,0.6)", color: S.muted, fontWeight: 600, fontSize: 14, cursor: "pointer" }}>
+                설정 변경
+              </button>
+            </div>
+          </section>
         )}
       </main>
     </div>
