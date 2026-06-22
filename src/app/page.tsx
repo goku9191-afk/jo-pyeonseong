@@ -185,7 +185,7 @@ export default function Page() {
       {/* Header */}
       <header className="text-center pt-8 pb-2">
         <h1 className="text-3xl font-bold" style={{ color: "#c084fc" }}>
-          🌸 조편성 도우미
+          🌸 조편성 프로그램
         </h1>
         <p className="text-sm mt-1" style={{ color: "#a78bca" }}>
           쉽고 빠른 학급 조편성

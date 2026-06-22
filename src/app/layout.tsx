@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "조편성 도우미",
+  title: "조편성 프로그램",
   description: "학급 조편성을 쉽고 빠르게!",
 };
 
